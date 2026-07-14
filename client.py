@@ -120,8 +120,11 @@ def video_sender():
                     continue
 
                 img_bytes = encoded.tobytes()
+                send_ts = time.time()
                 length_header = struct.pack(">I", len(img_bytes))
+                ts_bytes = struct.pack(">d", send_ts)
                 client_socket.sendall(length_header)
+                client_socket.sendall(ts_bytes)
                 client_socket.sendall(img_bytes)
 
                 elapsed = time.time() - start_time

@@ -45,6 +45,10 @@ GRID_COLS = 3
 AUDIT_LOG_PATH = "audit_log.csv"
 audit_lock = threading.Lock()
 
+METRICS_LOG_PATH = "metrics_log.csv"
+metrics_lock = threading.Lock()
+METRICS_WINDOW = 30  # 이 프레임 수마다 한 번씩 통계 계산
+
 running = True
 clients = {}
 clients_lock = threading.Lock()
@@ -68,6 +72,23 @@ def log_audit(cid, action, detail=""):
                 cid if cid is not None else "-",
                 action,
                 detail,
+            ])
+
+
+def log_metrics(cid, avg_latency_ms, fps, kbps, concurrent_clients):
+    with metrics_lock:
+        file_exists = os.path.isfile(METRICS_LOG_PATH)
+        with open(METRICS_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "student_id", "avg_latency_ms", "fps", "kbps", "concurrent_clients"])
+            writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                cid,
+                f"{avg_latency_ms:.2f}",
+                f"{fps:.2f}",
+                f"{kbps:.2f}",
+                concurrent_clients,
             ])
 
 
@@ -177,12 +198,16 @@ def handle_client(conn, addr):
 
     threading.Thread(target=control_sender, args=(cid, addr[0]), daemon=True).start()
 
-    # 3. 영상 수신 루프
+    # 3. 영상 수신 루프 (+ 성능 측정)
+    stats = {"latencies": [], "bytes": 0, "frame_count": 0, "window_start": time.time()}
     try:
         while running and cid in clients:
             length_bytes = reader.read_exact(4)
             (length,) = struct.unpack(">I", length_bytes)
+            ts_bytes = reader.read_exact(8)
+            (send_ts,) = struct.unpack(">d", ts_bytes)
             img_data = reader.read_exact(length)
+            recv_ts = time.time()
 
             img_array = np.frombuffer(img_data, dtype=np.uint8)
             frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -191,6 +216,23 @@ def handle_client(conn, addr):
 
             with clients[cid]["frame_lock"]:
                 clients[cid]["frame"] = frame
+
+            # 성능 통계 누적
+            stats["latencies"].append((recv_ts - send_ts) * 1000)  # ms
+            stats["bytes"] += length
+            stats["frame_count"] += 1
+
+            if stats["frame_count"] >= METRICS_WINDOW:
+                elapsed = time.time() - stats["window_start"]
+                avg_latency = sum(stats["latencies"]) / len(stats["latencies"])
+                fps = stats["frame_count"] / elapsed if elapsed > 0 else 0
+                kbps = (stats["bytes"] / 1024) / elapsed if elapsed > 0 else 0
+                with clients_lock:
+                    concurrent = len(clients)
+                log_metrics(cid, avg_latency, fps, kbps, concurrent)
+                print(f"[서버] 학생 #{cid} 측정: 평균지연 {avg_latency:.1f}ms, "
+                      f"FPS {fps:.1f}, 대역폭 {kbps:.1f}KB/s, 동시접속 {concurrent}명")
+                stats = {"latencies": [], "bytes": 0, "frame_count": 0, "window_start": time.time()}
     except (ConnectionError, KeyError):
         pass
     finally:

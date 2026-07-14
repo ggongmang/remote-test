@@ -1,22 +1,15 @@
 """
-server.py - 노트북(교사 PC 역할)에서 실행 [M3]
+server.py - 노트북(교사 PC 역할)에서 실행 [M4]
 
-구조:
-- 영상 채널(9999): 여러 클라이언트를 동시에 accept, 각 클라이언트마다 수신 스레드 생성
-- 제어 채널(9998): 클라이언트별로 별도 연결, 선택된 학생에게만 명령 전송
+M3 대비 추가된 것:
+- 인증: 클라이언트 접속 시 공유 비밀키(AUTH_KEY) 확인, 불일치 시 연결 거부
+- 감사 로그: audit_log.csv에 연결/해제/인증실패/선택/잠금 이벤트 기록
 
-화면:
-- "Classroom Monitor" 창: 전체 학생 화면 썸네일 그리드 (읽기 전용)
-- "Control" 창: 숫자 키(1~9)로 선택한 학생 화면을 크게 표시, 마우스/키보드/잠금 제어 가능
-
-조작법:
-- 숫자 키 1~9: 해당 번호의 학생 선택 (Control 창 열림)
-- ESC: 선택 해제 (Control 창 닫고 그리드로 복귀)
+조작법 (M3와 동일):
+- 숫자 키 1~9: 학생 선택
+- ESC: 선택 해제
 - L: 선택된 학생 화면 잠금 토글
 - Q: 전체 종료
-
-한계: 현재 버전은 학생 수가 9명을 넘으면 숫자 키로 선택할 수 없음.
-      실제 30명 규모 교실에서는 클릭 기반 선택으로 개선 필요 (다음 단계 과제).
 """
 
 import ctypes
@@ -35,59 +28,75 @@ import threading
 import queue
 import json
 import time
+import csv
+import os
 import cv2
 import numpy as np
+
+# ⚠️ 데스크탑(client.py)의 AUTH_KEY와 반드시 동일해야 함
+AUTH_KEY = "classroom-secret-2026"
 
 VIDEO_PORT = 9999
 CONTROL_PORT = 9998
 
-THUMB_W, THUMB_H = 320, 180  # 그리드 썸네일 크기
+THUMB_W, THUMB_H = 320, 180
 GRID_COLS = 3
 
+AUDIT_LOG_PATH = "audit_log.csv"
+audit_lock = threading.Lock()
+
 running = True
-clients = {}          # cid -> {"frame":..., "frame_lock":..., "addr":..., "control_queue":...}
+clients = {}
 clients_lock = threading.Lock()
 next_id_holder = {"n": 1}
-
 selected_id = {"id": None}
 
 last_move_time = {"t": 0.0}
 MOVE_THROTTLE_SEC = 0.05
 
 
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("연결이 끊어졌습니다.")
-        buf += chunk
-    return buf
+def log_audit(cid, action, detail=""):
+    """중요 이벤트를 audit_log.csv에 기록 (타임스탬프, 학생ID, 행동, 상세)"""
+    with audit_lock:
+        file_exists = os.path.isfile(AUDIT_LOG_PATH)
+        with open(AUDIT_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "student_id", "action", "detail"])
+            writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                cid if cid is not None else "-",
+                action,
+                detail,
+            ])
 
 
-def video_receiver(cid, conn):
-    try:
-        while running and cid in clients:
-            length_bytes = recv_exact(conn, 4)
-            (length,) = struct.unpack(">I", length_bytes)
-            img_data = recv_exact(conn, length)
+class ConnReader:
+    """TCP는 스트림이라 메시지 경계가 보장되지 않으므로,
+    줄바꿈 기준(인증 메시지)과 길이 헤더 기준(영상 프레임)을 모두
+    다룰 수 있도록 버퍼를 직접 관리하는 헬퍼."""
 
-            img_array = np.frombuffer(img_data, dtype=np.uint8)
-            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            if frame is None:
-                continue
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
 
-            with clients[cid]["frame_lock"]:
-                clients[cid]["frame"] = frame
-    except (ConnectionError, KeyError):
-        pass
-    finally:
-        conn.close()
-        with clients_lock:
-            clients.pop(cid, None)
-        if selected_id["id"] == cid:
-            selected_id["id"] = None
-        print(f"[서버] 학생 #{cid} 연결 끊김")
+    def read_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("연결이 끊어졌습니다.")
+            self.buf += chunk
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def read_line(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("연결이 끊어졌습니다.")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line
 
 
 def control_sender(cid, client_ip):
@@ -122,6 +131,78 @@ def control_sender(cid, client_ip):
         control_sock.close()
 
 
+def handle_client(conn, addr):
+    """접속 -> 인증 -> (성공 시) 영상 수신 루프까지 한 스레드가 전담"""
+    reader = ConnReader(conn)
+
+    # 1. 인증 절차
+    try:
+        auth_line = reader.read_line()
+        auth_msg = json.loads(auth_line.decode("utf-8"))
+    except Exception:
+        conn.close()
+        print(f"[서버] 인증 메시지 형식 오류, 연결 거부: {addr}")
+        log_audit(None, "AUTH_FAIL", f"IP={addr[0]} (형식 오류)")
+        return
+
+    if auth_msg.get("token") != AUTH_KEY:
+        try:
+            conn.sendall((json.dumps({"status": "rejected"}) + "\n").encode())
+        except OSError:
+            pass
+        conn.close()
+        print(f"[서버] 인증 실패, 연결 거부: {addr}")
+        log_audit(None, "AUTH_FAIL", f"IP={addr[0]}")
+        return
+
+    try:
+        conn.sendall((json.dumps({"status": "ok"}) + "\n").encode())
+    except OSError:
+        conn.close()
+        return
+
+    # 2. 인증 성공 -> 클라이언트 등록
+    with clients_lock:
+        cid = next_id_holder["n"]
+        next_id_holder["n"] += 1
+        clients[cid] = {
+            "frame": None,
+            "frame_lock": threading.Lock(),
+            "addr": addr[0],
+            "control_queue": queue.Queue(),
+        }
+
+    print(f"[서버] 학생 #{cid} 인증 성공, 연결됨: {addr}")
+    log_audit(cid, "CONNECT", f"IP={addr[0]}")
+
+    threading.Thread(target=control_sender, args=(cid, addr[0]), daemon=True).start()
+
+    # 3. 영상 수신 루프
+    try:
+        while running and cid in clients:
+            length_bytes = reader.read_exact(4)
+            (length,) = struct.unpack(">I", length_bytes)
+            img_data = reader.read_exact(length)
+
+            img_array = np.frombuffer(img_data, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+
+            with clients[cid]["frame_lock"]:
+                clients[cid]["frame"] = frame
+    except (ConnectionError, KeyError):
+        pass
+    finally:
+        conn.close()
+        with clients_lock:
+            clients.pop(cid, None)
+        if selected_id["id"] == cid:
+            selected_id["id"] = None
+        print(f"[서버] 학생 #{cid} 연결 끊김")
+        log_audit(cid, "DISCONNECT")
+
+
 def video_accept_loop():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -134,20 +215,7 @@ def video_accept_loop():
             conn, addr = server_socket.accept()
         except OSError:
             break
-
-        with clients_lock:
-            cid = next_id_holder["n"]
-            next_id_holder["n"] += 1
-            clients[cid] = {
-                "frame": None,
-                "frame_lock": threading.Lock(),
-                "addr": addr[0],
-                "control_queue": queue.Queue(),
-            }
-
-        print(f"[서버] 학생 #{cid} 연결됨: {addr}")
-        threading.Thread(target=video_receiver, args=(cid, conn), daemon=True).start()
-        threading.Thread(target=control_sender, args=(cid, addr[0]), daemon=True).start()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
     server_socket.close()
 
@@ -212,8 +280,6 @@ def main():
     grid_window = "Classroom Monitor (1-9: select student, Q: quit)"
     control_window = "Control"
     cv2.namedWindow(grid_window)
-    # Control 창은 학생 선택 시점에 생성하므로 콜백도 그때 등록
-
     control_window_open = False
 
     while running:
@@ -248,11 +314,13 @@ def main():
                 if candidate in clients:
                     selected_id["id"] = candidate
                     print(f"[서버] 학생 #{candidate} 선택됨")
+                    log_audit(candidate, "SELECT")
         elif key == ord("l"):
             cid = selected_id["id"]
             if cid is not None and cid in clients:
                 clients[cid]["control_queue"].put({"type": "lock_toggle"})
                 print(f"[서버] 학생 #{cid} 잠금 토글 명령 전송")
+                log_audit(cid, "LOCK_TOGGLE")
         elif 32 <= key <= 126:
             cid = selected_id["id"]
             if cid is not None and cid in clients:

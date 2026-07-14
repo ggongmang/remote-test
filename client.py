@@ -1,19 +1,19 @@
 """
-client.py - 데스크탑(학생 PC 역할)에서 실행 [M2]
-- 영상 채널(9999): 화면을 캡처해서 서버로 전송
-- 제어 채널(9998): 서버로부터 마우스/키보드/잠금 명령을 받아 실행
+client.py - 데스크탑(학생 PC 역할)에서 실행 [M4]
 
-주의: 화면 잠금은 실제로 키보드/마우스 입력을 막는 것이 아니라,
-전체화면 검은 오버레이 창을 띄워 화면을 가리는 방식입니다.
-(OS 레벨 입력 차단은 이번 단계 범위 밖 - 알려진 한계로 문서화)
+M2/M3 대비 추가된 것:
+- 인증: 서버 접속 시 공유 비밀키(AUTH_KEY)를 전송, 서버가 거부하면 즉시 종료
+- 상시 동의 표시: 서버에 연결되어 있는 동안 화면 상단에 항상
+  "선생님이 이 화면을 보고 있습니다" 배너를 표시 (잠금 여부와 무관하게 항상 뜸)
+
+주의: 화면 잠금은 실제 입력을 BlockInput()으로 차단하지만,
+동의 표시 배너는 시각적 표시일 뿐 사용자가 다른 창으로 가릴 수 있음 (알려진 한계)
 """
 
 import ctypes
 
-# Windows DPI 가상화를 끄고 실제 물리 픽셀 좌표를 그대로 사용하도록 설정
-# (mss 캡처 좌표와 pyautogui 제어 좌표가 어긋나는 문제를 방지)
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
@@ -32,7 +32,10 @@ import cv2
 import numpy as np
 import pyautogui
 
-# 여기를 노트북(서버)의 IP 주소로 바꿔주세요
+# ⚠️ 노트북(server.py)의 AUTH_KEY와 반드시 동일해야 함
+AUTH_KEY = "classroom-secret-2026"
+
+# ⚠️ 여기를 노트북(서버)의 IP 주소로 바꿔주세요
 SERVER_IP = "172.30.1.53"
 VIDEO_PORT = 9999
 CONTROL_PORT = 9998
@@ -40,11 +43,13 @@ CONTROL_PORT = 9998
 JPEG_QUALITY = 60
 TARGET_FPS = 10
 
-pyautogui.FAILSAFE = False  # 원격 제어 특성상 모서리 이동 예외를 끔
+pyautogui.FAILSAFE = False
 
 running = True
 lock_state = {"locked": False}
+connection_state = {"connected": False}
 overlay_root = None
+banner_root = None
 
 
 def is_admin():
@@ -54,8 +59,19 @@ def is_admin():
         return False
 
 
+def recv_line(sock):
+    """개행 문자가 나올 때까지 받아서 한 줄을 반환 (인증 응답 수신용)"""
+    buf = b""
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("서버 응답 없음")
+        buf += chunk
+    line, _ = buf.split(b"\n", 1)
+    return line
+
+
 def video_sender():
-    """영상 채널: 화면을 캡처해서 서버로 전송"""
     global running
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     print(f"[클라이언트-영상] {SERVER_IP}:{VIDEO_PORT} 연결 시도 중...")
@@ -65,7 +81,26 @@ def video_sender():
         print(f"[클라이언트-영상] 연결 실패: {e}")
         running = False
         return
-    print("[클라이언트-영상] 서버에 연결됨")
+
+    # 인증 절차: 토큰 전송 -> 서버 응답 확인
+    try:
+        client_socket.sendall((json.dumps({"token": AUTH_KEY}) + "\n").encode("utf-8"))
+        resp_line = recv_line(client_socket)
+        resp = json.loads(resp_line.decode("utf-8"))
+    except (ConnectionError, json.JSONDecodeError, OSError) as e:
+        print(f"[클라이언트-영상] 인증 통신 오류: {e}")
+        client_socket.close()
+        running = False
+        return
+
+    if resp.get("status") != "ok":
+        print("[클라이언트-영상] 인증 실패 - 서버가 접속을 거부했습니다. AUTH_KEY를 확인하세요.")
+        client_socket.close()
+        running = False
+        return
+
+    print("[클라이언트-영상] 인증 성공, 화면 전송 시작")
+    connection_state["connected"] = True
 
     frame_interval = 1.0 / TARGET_FPS
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -97,13 +132,12 @@ def video_sender():
         print(f"[클라이언트-영상] 연결 종료: {e}")
     finally:
         client_socket.close()
+        connection_state["connected"] = False
         running = False
 
 
 def handle_command(cmd):
     ctype = cmd.get("type")
-
-    # 잠금 상태에서는 잠금 해제 명령 외에는 무시 (교사만 해제 가능하게)
     if lock_state["locked"] and ctype != "lock_toggle":
         return
 
@@ -115,7 +149,6 @@ def handle_command(cmd):
         pyautogui.press(cmd["char"])
     elif ctype == "lock_toggle":
         lock_state["locked"] = not lock_state["locked"]
-        # Windows API로 실제 마우스/키보드 입력 차단 (Ctrl+Alt+Del은 OS가 예외 처리)
         result = ctypes.windll.user32.BlockInput(lock_state["locked"])
         if result == 0:
             print("[클라이언트] 경고: BlockInput 실패 - 관리자 권한으로 실행했는지 확인하세요")
@@ -123,8 +156,6 @@ def handle_command(cmd):
 
 
 def control_receiver():
-    """제어 채널: 서버로부터 명령을 받아 실행"""
-    global running
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("0.0.0.0", CONTROL_PORT))
@@ -158,7 +189,7 @@ def control_receiver():
 
 
 def main():
-    global overlay_root
+    global overlay_root, banner_root
 
     if not is_admin():
         print("[클라이언트] 경고: 관리자 권한이 아닙니다. BlockInput(입력 차단)이 동작하지 않을 수 있습니다.")
@@ -169,41 +200,60 @@ def main():
     t_video.start()
     t_control.start()
 
-    # 잠금 오버레이 창 준비 (평소엔 숨김 상태)
+    # --- 잠금 오버레이 창 (전체화면, 평소엔 숨김) ---
     overlay_root = tk.Tk()
     overlay_root.withdraw()
     overlay_root.attributes("-fullscreen", True)
     overlay_root.attributes("-topmost", True)
     overlay_root.configure(bg="black")
-    label = tk.Label(
-        overlay_root,
-        text="선생님이 화면을 잠갔습니다",
-        fg="white",
-        bg="black",
-        font=("맑은 고딕", 30),
-    )
-    label.pack(expand=True)
+    tk.Label(
+        overlay_root, text="선생님이 화면을 잠갔습니다",
+        fg="white", bg="black", font=("맑은 고딕", 30),
+    ).pack(expand=True)
 
-    last_state = False
+    # --- 상시 동의 표시 배너 (작은 창, 연결되어 있는 동안 항상 표시) ---
+    banner_root = tk.Toplevel(overlay_root)
+    banner_root.withdraw()
+    banner_root.overrideredirect(True)  # 제목표시줄/닫기버튼 없앰
+    banner_root.attributes("-topmost", True)
+    screen_w = banner_root.winfo_screenwidth()
+    banner_w, banner_h = 420, 32
+    banner_root.geometry(f"{banner_w}x{banner_h}+{(screen_w - banner_w) // 2}+0")
+    banner_root.configure(bg="#B00020")
+    tk.Label(
+        banner_root, text="🔴 선생님이 이 화면을 보고 있습니다",
+        fg="white", bg="#B00020", font=("맑은 고딕", 11, "bold"),
+    ).pack(expand=True, fill="both")
+
+    last_lock_state = False
+    last_conn_state = False
 
     def poll():
-        nonlocal last_state
+        nonlocal last_lock_state, last_conn_state
         if not running:
             overlay_root.destroy()
             return
-        if lock_state["locked"] != last_state:
+
+        if lock_state["locked"] != last_lock_state:
             if lock_state["locked"]:
                 overlay_root.deiconify()
             else:
                 overlay_root.withdraw()
-            last_state = lock_state["locked"]
+            last_lock_state = lock_state["locked"]
+
+        if connection_state["connected"] != last_conn_state:
+            if connection_state["connected"]:
+                banner_root.deiconify()
+            else:
+                banner_root.withdraw()
+            last_conn_state = connection_state["connected"]
+
         overlay_root.after(200, poll)
 
     overlay_root.after(200, poll)
     try:
         overlay_root.mainloop()
     finally:
-        # 안전장치: 프로그램이 어떤 이유로든 종료될 때 입력 차단이 풀린 상태로 남지 않도록 강제 해제
         ctypes.windll.user32.BlockInput(False)
         print("[클라이언트] 종료 (입력 차단 강제 해제됨)")
 

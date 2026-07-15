@@ -23,6 +23,7 @@ except Exception:
         pass
 
 import socket
+import ssl
 import struct
 import threading
 import queue
@@ -30,17 +31,24 @@ import json
 import time
 import csv
 import os
+import hmac
 import cv2
 import numpy as np
 
 # ⚠️ 데스크탑(client.py)의 AUTH_KEY와 반드시 동일해야 함
 AUTH_KEY = "classroom-secret-2026"
 
+# TLS 인증서 로드 (gen_cert.py로 미리 생성되어 있어야 함)
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+
 VIDEO_PORT = 9999
 CONTROL_PORT = 9998
 
 THUMB_W, THUMB_H = 320, 180
 GRID_COLS = 3
+MAX_GRID_HEIGHT = 900  # 학생 수가 많아져도 창이 화면 밖으로 안 나가도록 제한
+grid_scale = {"factor": 1.0}
 
 AUDIT_LOG_PATH = "audit_log.csv"
 audit_lock = threading.Lock()
@@ -120,6 +128,30 @@ class ConnReader:
         return line
 
 
+def control_reader(cid, control_sock):
+    """제어 채널에서 pong 응답을 읽어 RTT 기반 지연시간을 계산"""
+    buffer = b""
+    try:
+        while running and cid in clients:
+            data = control_sock.recv(4096)
+            if not data:
+                break
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "pong" and cid in clients:
+                    rtt_ms = (time.time() - msg["t"]) * 1000
+                    clients[cid]["latency_ms"] = rtt_ms / 2  # RTT의 절반을 편도 지연 근사치로 사용
+    except (OSError, KeyError):
+        pass
+
+
 def control_sender(cid, client_ip):
     control_sock = None
     for _ in range(20):
@@ -138,14 +170,23 @@ def control_sender(cid, client_ip):
         return
 
     print(f"[서버] 학생 #{cid} 제어 채널 연결됨")
+    threading.Thread(target=control_reader, args=(cid, control_sock), daemon=True).start()
+
+    last_ping = 0.0
     try:
         while running and cid in clients:
             try:
                 cmd = clients[cid]["control_queue"].get(timeout=0.5)
+                message = (json.dumps(cmd) + "\n").encode("utf-8")
+                control_sock.sendall(message)
             except queue.Empty:
-                continue
-            message = (json.dumps(cmd) + "\n").encode("utf-8")
-            control_sock.sendall(message)
+                pass
+
+            now = time.time()
+            if now - last_ping >= 3.0:
+                last_ping = now
+                ping_msg = (json.dumps({"type": "ping", "t": now}) + "\n").encode("utf-8")
+                control_sock.sendall(ping_msg)
     except (BrokenPipeError, ConnectionResetError, KeyError):
         pass
     finally:
@@ -166,7 +207,7 @@ def handle_client(conn, addr):
         log_audit(None, "AUTH_FAIL", f"IP={addr[0]} (형식 오류)")
         return
 
-    if auth_msg.get("token") != AUTH_KEY:
+    if not hmac.compare_digest(str(auth_msg.get("token", "")), AUTH_KEY):
         try:
             conn.sendall((json.dumps({"status": "rejected"}) + "\n").encode())
         except OSError:
@@ -191,6 +232,7 @@ def handle_client(conn, addr):
             "frame_lock": threading.Lock(),
             "addr": addr[0],
             "control_queue": queue.Queue(),
+            "latency_ms": None,
         }
 
     print(f"[서버] 학생 #{cid} 인증 성공, 연결됨: {addr}")
@@ -198,16 +240,13 @@ def handle_client(conn, addr):
 
     threading.Thread(target=control_sender, args=(cid, addr[0]), daemon=True).start()
 
-    # 3. 영상 수신 루프 (+ 성능 측정)
-    stats = {"latencies": [], "bytes": 0, "frame_count": 0, "window_start": time.time()}
+    # 3. 영상 수신 루프 (+ FPS/대역폭 측정, 지연시간은 별도 RTT 핑퐁으로 측정됨)
+    stats = {"bytes": 0, "frame_count": 0, "window_start": time.time()}
     try:
         while running and cid in clients:
             length_bytes = reader.read_exact(4)
             (length,) = struct.unpack(">I", length_bytes)
-            ts_bytes = reader.read_exact(8)
-            (send_ts,) = struct.unpack(">d", ts_bytes)
             img_data = reader.read_exact(length)
-            recv_ts = time.time()
 
             img_array = np.frombuffer(img_data, dtype=np.uint8)
             frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -217,22 +256,21 @@ def handle_client(conn, addr):
             with clients[cid]["frame_lock"]:
                 clients[cid]["frame"] = frame
 
-            # 성능 통계 누적
-            stats["latencies"].append((recv_ts - send_ts) * 1000)  # ms
             stats["bytes"] += length
             stats["frame_count"] += 1
 
             if stats["frame_count"] >= METRICS_WINDOW:
                 elapsed = time.time() - stats["window_start"]
-                avg_latency = sum(stats["latencies"]) / len(stats["latencies"])
                 fps = stats["frame_count"] / elapsed if elapsed > 0 else 0
                 kbps = (stats["bytes"] / 1024) / elapsed if elapsed > 0 else 0
+                latency = clients[cid].get("latency_ms")
                 with clients_lock:
                     concurrent = len(clients)
-                log_metrics(cid, avg_latency, fps, kbps, concurrent)
-                print(f"[서버] 학생 #{cid} 측정: 평균지연 {avg_latency:.1f}ms, "
+                log_metrics(cid, latency if latency is not None else -1, fps, kbps, concurrent)
+                latency_str = f"{latency:.1f}ms" if latency is not None else "측정중..."
+                print(f"[서버] 학생 #{cid} 측정: 지연(RTT/2) {latency_str}, "
                       f"FPS {fps:.1f}, 대역폭 {kbps:.1f}KB/s, 동시접속 {concurrent}명")
-                stats = {"latencies": [], "bytes": 0, "frame_count": 0, "window_start": time.time()}
+                stats = {"bytes": 0, "frame_count": 0, "window_start": time.time()}
     except (ConnectionError, KeyError):
         pass
     finally:
@@ -257,7 +295,16 @@ def video_accept_loop():
             conn, addr = server_socket.accept()
         except OSError:
             break
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+        try:
+            tls_conn = ssl_context.wrap_socket(conn, server_side=True)
+        except ssl.SSLError as e:
+            print(f"[서버] TLS 핸드셰이크 실패, 연결 거부: {addr} - {e}")
+            conn.close()
+            log_audit(None, "TLS_FAIL", f"IP={addr[0]}")
+            continue
+
+        threading.Thread(target=handle_client, args=(tls_conn, addr), daemon=True).start()
 
     server_socket.close()
 
@@ -294,7 +341,34 @@ def build_grid_image():
             row_thumbs.append(np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8))
         rows.append(np.hstack(row_thumbs))
 
-    return np.vstack(rows)
+    big_grid = np.vstack(rows)
+    h, w = big_grid.shape[:2]
+    if h > MAX_GRID_HEIGHT:
+        factor = MAX_GRID_HEIGHT / h
+        big_grid = cv2.resize(big_grid, (int(w * factor), int(h * factor)))
+        grid_scale["factor"] = factor
+    else:
+        grid_scale["factor"] = 1.0
+
+    return big_grid
+
+
+def grid_mouse_callback(event, x, y, flags, param):
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    factor = grid_scale["factor"] if grid_scale["factor"] > 0 else 1.0
+    orig_x = x / factor
+    orig_y = y / factor
+    col = int(orig_x // THUMB_W)
+    row = int(orig_y // THUMB_H)
+    idx = row * GRID_COLS + col
+    with clients_lock:
+        ids = sorted(clients.keys())
+    if 0 <= idx < len(ids):
+        candidate = ids[idx]
+        selected_id["id"] = candidate
+        print(f"[서버] 학생 #{candidate} 선택됨 (클릭)")
+        log_audit(candidate, "SELECT", "클릭")
 
 
 def control_mouse_callback(event, x, y, flags, param):
@@ -322,6 +396,7 @@ def main():
     grid_window = "Classroom Monitor (1-9: select student, Q: quit)"
     control_window = "Control"
     cv2.namedWindow(grid_window)
+    cv2.setMouseCallback(grid_window, grid_mouse_callback)
     control_window_open = False
 
     while running:

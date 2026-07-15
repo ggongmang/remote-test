@@ -21,6 +21,7 @@ except Exception:
         pass
 
 import socket
+import ssl
 import struct
 import threading
 import json
@@ -34,6 +35,11 @@ import pyautogui
 
 # ⚠️ 노트북(server.py)의 AUTH_KEY와 반드시 동일해야 함
 AUTH_KEY = "classroom-secret-2026"
+
+# TLS: server.crt(공개 인증서, git으로 받은 것)로 서버 신원을 검증 (TOFU 방식)
+tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+tls_context.check_hostname = False  # IP로 접속하므로 호스트명 검사는 끔
+tls_context.load_verify_locations(cafile="server.crt")
 
 # ⚠️ 여기를 노트북(서버)의 IP 주소로 바꿔주세요
 SERVER_IP = "172.30.1.53"
@@ -73,74 +79,88 @@ def recv_line(sock):
 
 def video_sender():
     global running
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print(f"[클라이언트-영상] {SERVER_IP}:{VIDEO_PORT} 연결 시도 중...")
-    try:
-        client_socket.connect((SERVER_IP, VIDEO_PORT))
-    except OSError as e:
-        print(f"[클라이언트-영상] 연결 실패: {e}")
-        running = False
-        return
+    while running:
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"[클라이언트-영상] {SERVER_IP}:{VIDEO_PORT} 연결 시도 중... (TLS)")
+        try:
+            client_socket = tls_context.wrap_socket(raw_socket, server_hostname="classroom-server")
+            client_socket.connect((SERVER_IP, VIDEO_PORT))
+        except ssl.SSLCertVerificationError as e:
+            print(f"[클라이언트-영상] 서버 인증서 검증 실패! 접속 대상이 진짜 우리 서버가 맞는지 의심됨: {e}")
+            running = False
+            return
+        except OSError as e:
+            print(f"[클라이언트-영상] 연결 실패: {e} - 5초 후 재시도")
+            time.sleep(5)
+            continue
 
-    # 인증 절차: 토큰 전송 -> 서버 응답 확인
-    try:
-        client_socket.sendall((json.dumps({"token": AUTH_KEY}) + "\n").encode("utf-8"))
-        resp_line = recv_line(client_socket)
-        resp = json.loads(resp_line.decode("utf-8"))
-    except (ConnectionError, json.JSONDecodeError, OSError) as e:
-        print(f"[클라이언트-영상] 인증 통신 오류: {e}")
-        client_socket.close()
-        running = False
-        return
+        # 인증 절차: 토큰 전송 -> 서버 응답 확인
+        try:
+            client_socket.sendall((json.dumps({"token": AUTH_KEY}) + "\n").encode("utf-8"))
+            resp_line = recv_line(client_socket)
+            resp = json.loads(resp_line.decode("utf-8"))
+        except (ConnectionError, json.JSONDecodeError, OSError) as e:
+            print(f"[클라이언트-영상] 인증 통신 오류: {e} - 5초 후 재시도")
+            client_socket.close()
+            time.sleep(5)
+            continue
 
-    if resp.get("status") != "ok":
-        print("[클라이언트-영상] 인증 실패 - 서버가 접속을 거부했습니다. AUTH_KEY를 확인하세요.")
-        client_socket.close()
-        running = False
-        return
+        if resp.get("status") != "ok":
+            print("[클라이언트-영상] 인증 실패 - 서버가 접속을 거부했습니다. AUTH_KEY를 확인하세요. (재시도 안 함)")
+            client_socket.close()
+            running = False
+            return
 
-    print("[클라이언트-영상] 인증 성공, 화면 전송 시작")
-    connection_state["connected"] = True
+        print("[클라이언트-영상] 인증 성공, 화면 전송 시작")
+        connection_state["connected"] = True
 
-    frame_interval = 1.0 / TARGET_FPS
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        frame_interval = 1.0 / TARGET_FPS
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
 
-    try:
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
-            while running:
-                start_time = time.time()
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                while running:
+                    start_time = time.time()
 
-                screenshot = sct.grab(monitor)
-                frame = np.array(screenshot)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    screenshot = sct.grab(monitor)
+                    frame = np.array(screenshot)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-                success, encoded = cv2.imencode(".jpg", frame, encode_params)
-                if not success:
-                    continue
+                    success, encoded = cv2.imencode(".jpg", frame, encode_params)
+                    if not success:
+                        continue
 
-                img_bytes = encoded.tobytes()
-                send_ts = time.time()
-                length_header = struct.pack(">I", len(img_bytes))
-                ts_bytes = struct.pack(">d", send_ts)
-                client_socket.sendall(length_header)
-                client_socket.sendall(ts_bytes)
-                client_socket.sendall(img_bytes)
+                    img_bytes = encoded.tobytes()
+                    length_header = struct.pack(">I", len(img_bytes))
+                    client_socket.sendall(length_header)
+                    client_socket.sendall(img_bytes)
 
-                elapsed = time.time() - start_time
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-    except (ConnectionError, ConnectionResetError, BrokenPipeError) as e:
-        print(f"[클라이언트-영상] 연결 종료: {e}")
-    finally:
-        client_socket.close()
-        connection_state["connected"] = False
-        running = False
+                    elapsed = time.time() - start_time
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+        except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as e:
+            print(f"[클라이언트-영상] 연결 끊김: {e}")
+        finally:
+            client_socket.close()
+            connection_state["connected"] = False
+
+        if running:
+            print("[클라이언트-영상] 5초 후 재연결 시도...")
+            time.sleep(5)
 
 
-def handle_command(cmd):
+def handle_command(cmd, conn):
     ctype = cmd.get("type")
+
+    if ctype == "ping":
+        try:
+            conn.sendall((json.dumps({"type": "pong", "t": cmd["t"]}) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        return
+
     if lock_state["locked"] and ctype != "lock_toggle":
         return
 
@@ -183,7 +203,7 @@ def control_receiver():
                     cmd = json.loads(line.decode("utf-8"))
                 except json.JSONDecodeError:
                     continue
-                handle_command(cmd)
+                handle_command(cmd, conn)
     except (ConnectionResetError, OSError):
         pass
     finally:
